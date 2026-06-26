@@ -1,0 +1,268 @@
+CREATE TABLE dim_customers (
+    customer_id VARCHAR(50) PRIMARY KEY,
+    customer_unique_id VARCHAR(50),
+    customer_city VARCHAR(100),
+    customer_state VARCHAR(10)
+);
+
+CREATE TABLE dim_products (
+    product_id VARCHAR(100) PRIMARY KEY,
+    product_category_name VARCHAR(255)
+);
+
+CREATE TABLE dim_date (
+    date_id SERIAL PRIMARY KEY,
+    full_date DATE UNIQUE,
+    year INT,
+    quarter INT,
+    month INT,
+    day INT
+);
+
+CREATE TABLE fact_orders (
+    order_id VARCHAR(50),
+    customer_id VARCHAR(50),
+    product_id VARCHAR(100),
+    date_id INT,
+
+    price NUMERIC(10,2),
+    freight_value NUMERIC(10,2),
+    total_amount NUMERIC(10,2),
+
+    order_status VARCHAR(30),
+
+    FOREIGN KEY(customer_id)
+        REFERENCES dim_customers(customer_id),
+
+    FOREIGN KEY(product_id)
+        REFERENCES dim_products(product_id),
+
+    FOREIGN KEY(date_id)
+        REFERENCES dim_date(date_id)
+);
+
+
+--staging area for raw dataset
+CREATE TABLE stg_customers (
+    customer_id VARCHAR(50),
+    customer_unique_id VARCHAR(50),
+    customer_zip_code_prefix VARCHAR(50),
+    customer_city VARCHAR(100),
+    customer_state VARCHAR(10)
+);
+
+CREATE TABLE stg_products (
+    product_id VARCHAR(100),
+    product_category_name VARCHAR(255),
+    product_name_lenght INT,
+    product_description_lenght INT,
+    product_photos_qty INT,
+    product_weight_g INT,
+    product_length_cm INT,
+    product_height_cm INT,
+    product_width_cm INT
+);
+
+CREATE TABLE stg_orders (
+    order_id VARCHAR(50),
+    customer_id VARCHAR(50),
+    order_status VARCHAR(30),
+    order_purchase_timestamp TIMESTAMP,
+    order_approved_at TIMESTAMP,
+    order_delivered_carrier_date TIMESTAMP,
+    order_delivered_customer_date TIMESTAMP,
+    order_estimated_delivery_date TIMESTAMP
+);
+
+CREATE TABLE stg_order_items (
+    order_id VARCHAR(50),
+    order_item_id INT,
+    product_id VARCHAR(50),
+    seller_id VARCHAR(50),
+    shipping_limit_date TIMESTAMP,
+    price NUMERIC(10,2),
+    freight_value NUMERIC(10,2)
+);
+
+SELECT COUNT(*) FROM stg_customers;
+SELECT COUNT(*) FROM stg_products;
+SELECT COUNT(*) FROM stg_orders;
+SELECT COUNT(*) FROM stg_order_items;
+
+--now actually we load data from stg area to dim & fact tables
+--use insert queries
+
+--1. Load dim_customers
+INSERT INTO dim_customers
+SELECT DISTINCT
+    customer_id,
+    customer_unique_id,
+    customer_city,
+    customer_state
+FROM stg_customers;
+
+--2. Load dim_products
+INSERT INTO dim_products
+SELECT DISTINCT
+    product_id,
+    product_category_name
+FROM stg_products;
+
+--3. Load dim_date
+INSERT INTO dim_date (
+    full_date,
+    year,
+    quarter,
+    month,
+    day
+)
+SELECT DISTINCT
+    DATE(order_purchase_timestamp),
+    EXTRACT(YEAR FROM order_purchase_timestamp),
+    EXTRACT(QUARTER FROM order_purchase_timestamp),
+    EXTRACT(MONTH FROM order_purchase_timestamp),
+    EXTRACT(DAY FROM order_purchase_timestamp)
+FROM stg_orders;
+
+--4. Load fact_orders
+INSERT INTO fact_orders
+(
+    order_id,
+    customer_id,
+    product_id,
+    date_id,
+    price,
+    freight_value,
+    total_amount,
+    order_status
+)
+SELECT
+    oi.order_id,
+    o.customer_id,
+    oi.product_id,
+    d.date_id,
+    oi.price,
+    oi.freight_value,
+    oi.price + oi.freight_value,
+    o.order_status
+
+FROM stg_order_items oi
+
+JOIN stg_orders o
+    ON oi.order_id = o.order_id
+
+JOIN dim_date d
+    ON DATE(o.order_purchase_timestamp) = d.full_date;
+
+
+--Create Business Views
+--vw_monthly_revenue
+
+CREATE OR REPLACE VIEW vw_monthly_revenue AS
+SELECT
+    DATE_TRUNC('month', d.full_date) AS month,
+    SUM(f.total_amount) AS revenue
+FROM fact_orders f
+JOIN dim_date d
+ON f.date_id = d.date_id
+
+GROUP BY DATE_TRUNC('month', d.full_date);
+
+--View 2 - running_revenue (Window Function + Running Total)
+
+CREATE OR REPLACE VIEW vw_running_revenue AS
+SELECT
+    DATE_TRUNC('month', d.full_date) AS month,
+
+    SUM(f.total_amount) AS revenue,
+
+    SUM(
+        SUM(f.total_amount)
+    ) OVER(
+        ORDER BY DATE_TRUNC('month', d.full_date)
+    ) AS running_total
+
+FROM fact_orders f
+JOIN dim_date d
+ON f.date_id=d.date_id
+
+GROUP BY DATE_TRUNC('month', d.full_date);
+
+--View 3 - revenue_growth (LEAD/LAG usage)
+
+CREATE OR REPLACE VIEW vw_revenue_growth AS
+SELECT
+    month,
+    revenue,
+    LAG(revenue) OVER (ORDER BY month) AS previous_revenue
+FROM
+(
+    SELECT
+        DATE_TRUNC('month', d.full_date) AS month,
+        SUM(f.total_amount) AS revenue
+    FROM fact_orders f
+    JOIN dim_date d
+        ON f.date_id = d.date_id
+    GROUP BY DATE_TRUNC('month', d.full_date)
+) monthly_data;
+
+--View 4 - Top Customers - ROW_NUMBER
+
+CREATE OR REPLACE VIEW vw_top_customers AS
+SELECT
+    customer_id,
+
+    SUM(total_amount) revenue,
+
+    ROW_NUMBER()
+    OVER(
+        ORDER BY SUM(total_amount) DESC
+    ) rn
+
+FROM fact_orders
+
+GROUP BY customer_id;
+
+--View 5 - Product Revenue % Contribution
+
+CREATE OR REPLACE VIEW vw_product_contribution AS
+SELECT
+    product_id,
+
+    SUM(total_amount) revenue,
+
+    ROUND(
+        100.0 *
+        SUM(total_amount)
+        /
+        SUM(SUM(total_amount))
+        OVER(),
+        2
+    ) contribution_pct
+
+FROM fact_orders
+
+GROUP BY product_id;
+
+
+--CTE Query
+WITH monthly_revenue AS
+(
+    SELECT
+        DATE_TRUNC('month', d.full_date) AS month,
+        SUM(f.total_amount) AS revenue
+
+    FROM fact_orders f
+    JOIN dim_date d
+        ON f.date_id = d.date_id
+
+    GROUP BY DATE_TRUNC('month', d.full_date)
+)
+
+SELECT *
+FROM monthly_revenue;
+
+
+SELECT COUNT(*) FROM dim_customers;
+
+SELECT * FROM vw_monthly_revenue LIMIT 5;
